@@ -7,85 +7,19 @@
 #include <mutex>
 #include <sstream>
 #include <vector>
+#include <csignal>
+#include <atomic>
+#include <future>
 
 #include "httplib.h"
 #include "stable-diffusion.h"
 
 #include "common/common.hpp"
+#include "common/base64.hpp"
 
 namespace fs = std::filesystem;
 
 // ----------------------- helpers -----------------------
-static const std::string base64_chars =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    "abcdefghijklmnopqrstuvwxyz"
-    "0123456789+/";
-
-std::string base64_encode(const std::vector<uint8_t>& bytes) {
-    std::string ret;
-    int val = 0, valb = -6;
-    for (uint8_t c : bytes) {
-        val = (val << 8) + c;
-        valb += 8;
-        while (valb >= 0) {
-            ret.push_back(base64_chars[(val >> valb) & 0x3F]);
-            valb -= 6;
-        }
-    }
-    if (valb > -6)
-        ret.push_back(base64_chars[((val << 8) >> (valb + 8)) & 0x3F]);
-    while (ret.size() % 4)
-        ret.push_back('=');
-    return ret;
-}
-
-inline bool is_base64(unsigned char c) {
-    return (isalnum(c) || (c == '+') || (c == '/'));
-}
-
-std::vector<uint8_t> base64_decode(const std::string& encoded_string) {
-    int in_len = static_cast<int>(encoded_string.size());
-    int i      = 0;
-    int j      = 0;
-    int in_    = 0;
-    uint8_t char_array_4[4], char_array_3[3];
-    std::vector<uint8_t> ret;
-
-    while (in_len-- && (encoded_string[in_] != '=') && is_base64(encoded_string[in_])) {
-        char_array_4[i++] = encoded_string[in_];
-        in_++;
-        if (i == 4) {
-            for (i = 0; i < 4; i++)
-                char_array_4[i] = static_cast<uint8_t>(base64_chars.find(char_array_4[i]));
-
-            char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
-            char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
-            char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
-
-            for (i = 0; i < 3; i++)
-                ret.push_back(char_array_3[i]);
-            i = 0;
-        }
-    }
-
-    if (i) {
-        for (j = i; j < 4; j++)
-            char_array_4[j] = 0;
-
-        for (j = 0; j < 4; j++)
-            char_array_4[j] = static_cast<uint8_t>(base64_chars.find(char_array_4[j]));
-
-        char_array_3[0] = (char_array_4[0] << 2) + ((char_array_4[1] & 0x30) >> 4);
-        char_array_3[1] = ((char_array_4[1] & 0xf) << 4) + ((char_array_4[2] & 0x3c) >> 2);
-        char_array_3[2] = ((char_array_4[2] & 0x3) << 6) + char_array_4[3];
-
-        for (j = 0; j < i - 1; j++)
-            ret.push_back(char_array_3[j]);
-    }
-
-    return ret;
-}
-
 struct SDSvrParams {
     std::string listen_ip = "127.0.0.1";
     int listen_port       = 1234;
@@ -263,10 +197,16 @@ void sd_log_cb(enum sd_log_level_t level, const char* log, void* data) {
     log_print(level, log, svr_params->verbose, svr_params->color);
 }
 
+
 struct LoraEntry {
     std::string name;
     std::string path;
 };
+
+
+std::atomic<bool> server_running = false;       // used to signal server shutdown gracefully
+std::atomic<bool> operation_cancelled = false;  // used to signal server shutdown gracefully
+
 
 int main(int argc, const char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--version") {
@@ -398,64 +338,46 @@ int main(int argc, const char** argv) {
                 return;
             }
 
-            json j                    = json::parse(req.body);
-            std::string prompt        = j.value("prompt", "");
-            int n                     = std::max(1, j.value("n", 1));
+            json j = json::parse(req.body);
+            SDGenerationParams gen_params = default_gen_params;
+            gen_params.from_json(j["gen"]);
+
             std::string size          = j.value("size", "");
             std::string output_format = j.value("output_format", "png");
             int output_compression    = j.value("output_compression", 100);
-            int width                 = 512;
-            int height                = 512;
+
             if (!size.empty()) {
                 auto pos = size.find('x');
                 if (pos != std::string::npos) {
                     try {
-                        width  = std::stoi(size.substr(0, pos));
-                        height = std::stoi(size.substr(pos + 1));
+                        gen_params.width = std::stoi(size.substr(0, pos));
+                        gen_params.height = std::stoi(size.substr(pos + 1));
                     } catch (...) {
                     }
                 }
             }
 
-            if (prompt.empty()) {
+            if (gen_params.prompt.empty()) {
                 res.status = 400;
                 res.set_content(R"({"error":"prompt required"})", "application/json");
                 return;
             }
-
-            std::string sd_cpp_extra_args_str = extract_and_remove_sd_cpp_extra_args(prompt);
 
             if (output_format != "png" && output_format != "jpeg") {
                 res.status = 400;
                 res.set_content(R"({"error":"invalid output_format, must be one of [png, jpeg]"})", "application/json");
                 return;
             }
-            if (n <= 0)
-                n = 1;
-            if (n > 8)
-                n = 8;  // safety
+
+            if (gen_params.batch_count <= 0)
+                gen_params.batch_count = 1;
+            if (gen_params.batch_count > 8)
+                gen_params.batch_count = 8;  // safety
             if (output_compression > 100) {
                 output_compression = 100;
             }
             if (output_compression < 0) {
                 output_compression = 0;
-            }
-
-            json out;
-            out["created"]       = static_cast<long long>(std::time(nullptr));
-            out["data"]          = json::array();
-            out["output_format"] = output_format;
-
-            SDGenerationParams gen_params = default_gen_params;
-            gen_params.prompt             = prompt;
-            gen_params.width              = width;
-            gen_params.height             = height;
-            gen_params.batch_count        = n;
-
-            if (!sd_cpp_extra_args_str.empty() && !gen_params.from_json_str(sd_cpp_extra_args_str)) {
-                res.status = 400;
-                res.set_content(R"({"error":"invalid sd_cpp_extra_args"})", "application/json");
-                return;
             }
 
             if (gen_params.sample_params.sample_steps > 100)
@@ -467,8 +389,14 @@ int main(int argc, const char** argv) {
                 return;
             }
 
+            json out;
+            out["created"]       = static_cast<long long>(std::time(nullptr));
+            out["data"]          = json::array();
+            out["output_format"] = output_format;
+
             LOG_DEBUG("%s\n", gen_params.to_string().c_str());
 
+            // this could be passed too...
             sd_image_t init_image    = {(uint32_t)gen_params.width, (uint32_t)gen_params.height, 3, nullptr};
             sd_image_t control_image = {(uint32_t)gen_params.width, (uint32_t)gen_params.height, 3, nullptr};
             sd_image_t mask_image    = {(uint32_t)gen_params.width, (uint32_t)gen_params.height, 1, nullptr};
@@ -505,15 +433,13 @@ int main(int argc, const char** argv) {
             };
 
             sd_image_t* results = nullptr;
-            int num_results     = 0;
 
             {
                 std::lock_guard<std::mutex> lock(sd_ctx_mutex);
                 results     = generate_image(sd_ctx, &img_gen_params);
-                num_results = gen_params.batch_count;
             }
 
-            for (int i = 0; i < num_results; i++) {
+            for (int i = 0; i < gen_params.batch_count; i++) {
                 if (results[i].data == nullptr) {
                     continue;
                 }
@@ -555,15 +481,17 @@ int main(int argc, const char** argv) {
                 return;
             }
 
+            SDGenerationParams gen_params = default_gen_params;
+            gen_params.from_json_str(req.form.get_field("gen"));
+/*
             std::string prompt = req.form.get_field("prompt");
             if (prompt.empty()) {
                 res.status = 400;
                 res.set_content(R"({"error":"prompt required"})", "application/json");
                 return;
             }
-
             std::string sd_cpp_extra_args_str = extract_and_remove_sd_cpp_extra_args(prompt);
-
+*/
             size_t image_count = req.form.get_file_count("image[]");
             if (image_count == 0) {
                 res.status = 400;
@@ -626,7 +554,7 @@ int main(int argc, const char** argv) {
             if (output_compression < 0) {
                 output_compression = 0;
             }
-
+/*
             SDGenerationParams gen_params = default_gen_params;
             gen_params.prompt             = prompt;
             gen_params.width              = width;
@@ -641,7 +569,7 @@ int main(int argc, const char** argv) {
 
             if (gen_params.sample_params.sample_steps > 100)
                 gen_params.sample_params.sample_steps = 100;
-
+*/
             if (!gen_params.process_and_check(IMG_GEN, "")) {
                 res.status = 400;
                 res.set_content(R"({"error":"invalid params"})", "application/json");
@@ -1143,9 +1071,41 @@ int main(int argc, const char** argv) {
     });
 
     LOG_INFO("listening on: %s:%d\n", svr_params.listen_ip.c_str(), svr_params.listen_port);
-    svr.listen(svr_params.listen_ip, svr_params.listen_port);
+
+
+    std::signal(SIGINT, [](int signal) {
+        // this blocks ctrl-c from propegating to the long running operations currently; next big todo
+        server_running.store(false, std::memory_order_release);
+    });
+
+    std::future<void> ft;
+
+    do {
+        ft = std::async(std::launch::async, [&]() {
+            server_running.store(true, std::memory_order_release);
+            svr.listen(svr_params.listen_ip, svr_params.listen_port);
+            LOG_INFO("stopping server...");
+            return;
+        });
+
+        std::future_status ft_status;
+        do {
+            if (!ft.valid()) break;
+            ft_status = ft.wait_for(std::chrono::milliseconds(1000));
+        } while (server_running.load(std::memory_order_relaxed) && !operation_cancelled.load(std::memory_order_relaxed) && ft_status != std::future_status::ready);
+        // todo: detect and flag when operation might be cancelled from client (eg. connection dropped)
+
+        if (!ft.valid()) {
+            LOG_ERROR("server error: unexpected error");
+            break;
+        }
+    } while (server_running.load(std::memory_order_relaxed));
 
     // cleanup
+    svr.stop();
+    ft.wait();
+    LOG_INFO("shutting down...");
     free_sd_ctx(sd_ctx);
+
     return 0;
 }

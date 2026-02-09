@@ -210,6 +210,7 @@ struct StringOption {
     std::string long_name;
     std::string desc;
     std::string* target;
+    bool assigned = false;
 };
 
 struct IntOption {
@@ -217,6 +218,7 @@ struct IntOption {
     std::string long_name;
     std::string desc;
     int* target;
+    bool assigned = false;
 };
 
 struct FloatOption {
@@ -224,6 +226,7 @@ struct FloatOption {
     std::string long_name;
     std::string desc;
     float* target;
+    bool assigned = false;
 };
 
 struct BoolOption {
@@ -232,6 +235,7 @@ struct BoolOption {
     std::string desc;
     bool keep_true;
     bool* target;
+    bool assigned = false;
 };
 
 struct ManualOption {
@@ -239,6 +243,7 @@ struct ManualOption {
     std::string long_name;
     std::string desc;
     std::function<int(int argc, const char** argv, int index)> cb;
+    bool assigned = false;
 };
 
 struct ArgOptions {
@@ -345,7 +350,40 @@ struct ArgOptions {
     }
 };
 
-static bool parse_options(int argc, const char** argv, const std::vector<ArgOptions>& options_list) {
+/** given a params object and the parsed ArgOptions, convert to json (params requires manual_options_to_json(manual_options const&, json&) call **/
+template<typename PARAMS>
+json options_to_json(PARAMS const& params, ArgOptions const& options) {
+    json opt_json = json::object();
+
+    auto get_opts = [&opt_json](std::vector<auto> const& v) {
+        for (auto const& opt : v) {
+            if (!opt.assigned)  continue;  // skip unassigned options
+            size_t flag = opt.long_name.find("--");
+            if (flag != 0) {
+                LOG_ERROR("error: processing argument `%s`", opt.long_name.c_str());
+                continue;
+            }
+            std::string node = opt.long_name.substr(2);
+            // the from_json_str function I've converted uses all underscores instead of matching ArgOptions formatting
+            // let's just make it work for now.
+            std::replace(node.begin(), node.end(), '-', '_');
+            opt_json[node] = *opt.target;
+        }
+    };
+
+    // automate transfer of simple types
+    get_opts(options.string_options);
+    get_opts(options.int_options);
+    get_opts(options.float_options);
+    get_opts(options.bool_options);
+    // unfortunately, manual options will need manual conversion
+    params.manual_options_to_json(options.manual_options, opt_json);
+
+    return opt_json;
+}
+
+//static bool parse_options(int argc, const char** argv, const std::vector<ArgOptions>& options_list) {
+static bool parse_options(int argc, const char** argv, std::vector<ArgOptions>& options_list) {
     bool invalid_arg = false;
     std::string arg;
 
@@ -354,6 +392,7 @@ static bool parse_options(int argc, const char** argv, const std::vector<ArgOpti
             if ((option.short_name.size() > 0 && arg == option.short_name) ||
                 (option.long_name.size() > 0 && arg == option.long_name)) {
                 apply_fn(option);
+                option.assigned = true;
                 return true;
             }
         }
@@ -1539,15 +1578,14 @@ struct SDGenerationParams {
         return options;
     }
 
-    bool from_json_str(const std::string& json_str) {
-        json j;
-        try {
-            j = json::parse(json_str);
-        } catch (...) {
-            LOG_ERROR("json parse failed %s", json_str.c_str());
-            return false;
+    void manual_options_to_json(std::vector<ManualOption> const& options, json& j) const {
+        for (auto const& opt : options) {
+            if (!opt.assigned) continue;  // skip unassigned options (leave default)
         }
+        LOG_DEBUG("debug: SDGenerationParams::manual_options_to_json: TODO");
+    }
 
+    bool from_json(const json& j) {
         auto load_if_exists = [&](const char* key, auto& out) {
             if (j.contains(key)) {
                 using T = std::decay_t<decltype(out)>;
@@ -1626,6 +1664,17 @@ struct SDGenerationParams {
         }
 
         return true;
+    }
+
+    bool from_json_str(const std::string& json_str) {
+        json j;
+        try {
+            j = json::parse(json_str);
+        } catch (...) {
+            LOG_ERROR("json parse failed %s", json_str.c_str());
+            return false;
+        }
+        return from_json(j);
     }
 
     void extract_and_remove_lora(const std::string& lora_model_dir) {
